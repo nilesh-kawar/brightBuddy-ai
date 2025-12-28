@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@deepgram/sdk": "^4.11.3",
-    "framer-motion": "^10.16.4",
+    "framer-motion": "^12.23.26",
     "groq-sdk": "^0.37.0",
     "lucide-react": "^0.292.0",
     "next": "^16.1.1",

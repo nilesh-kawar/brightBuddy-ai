@@ -1,134 +1,197 @@
+import { NextResponse } from "next/server";
+import sdk from "microsoft-cognitiveservices-speech-sdk";
+import Groq from "groq-sdk";
 
-import { NextResponse } from 'next/server';
-import { createClient } from '@deepgram/sdk';
-import Groq from 'groq-sdk';
-
+/**
+ * POST /api/voice
+ * Supports:
+ * - audio → STT → LLM → TTS
+ * - text  → TTS (greeting / intro)
+ */
 export async function POST(req) {
+    console.log("🚀 API /api/respond called");
     try {
-        // 1. Get Audio or Text from Request
         const formData = await req.formData();
-        const audioFile = formData.get('audio');
-        const textInput = formData.get('text'); // New: Allow direct text input for TTS
+        const audioFile = formData.get("audio");
+        const textInput = formData.get("text");
 
-        // 2. Initialize Clients
-        const deepgramApiKey = process.env.DEEPGRAM_API_KEY;
+        console.log("📦 FormData received:", {
+            audio: audioFile ? "Present (Blob)" : "Missing",
+            text: textInput || "Missing"
+        });
+
+        const speechKey = process.env.AZURE_SPEECH_KEY;
+        const speechRegion = process.env.AZURE_SPEECH_REGION;
         const groqApiKey = process.env.GROQ_API_KEY;
 
-        if (!deepgramApiKey || !groqApiKey) {
-            console.error("Missing API Keys");
-            return NextResponse.json({ error: 'Server configuration error (Missing Keys)' }, { status: 500 });
+        if (!speechKey || !speechRegion || !groqApiKey) {
+            console.error("❌ Missing environment variables");
+            return NextResponse.json(
+                { error: "Missing environment variables" },
+                { status: 500 }
+            );
         }
 
-        const deepgram = createClient(deepgramApiKey);
         const groq = new Groq({ apiKey: groqApiKey });
 
-        let llmResponse = "";
         let transcript = "";
+        let llmResponse = "";
 
-        if (textInput) {
-            // Direct TTS Mode (e.g., for Greeting)
-            llmResponse = textInput;
-            console.log("Generating TTS for:", llmResponse);
-        } else if (audioFile) {
-            // Full Pipeline Mode (STT -> LLM -> TTS)
-            const audioBuffer = await audioFile.arrayBuffer();
-            const buffer = Buffer.from(audioBuffer);
+        /* -------------------- STT -------------------- */
+        if (!textInput && audioFile) {
+            console.log("🎤 Starting Azure STT (Hindi)...");
 
-            // 3. Step 1: Speech-to-Text (STT) via Deepgram
-            console.log("Transcribing...");
-            const { result, error: sttError } = await deepgram.listen.prerecorded.transcribeFile(
-                buffer,
-                {
-                    model: 'nova-2',
-                    language: 'en-IN', // Indian English
-                    smart_format: true,
-                }
+            const audioBuffer = Buffer.from(await audioFile.arrayBuffer());
+            console.log("🔢 Audio buffer size:", audioBuffer.length);
+
+            const speechConfig = sdk.SpeechConfig.fromSubscription(
+                speechKey,
+                speechRegion
+            );
+            speechConfig.speechRecognitionLanguage = "hi-IN"; // Changed to Hindi
+
+            const audioConfig = sdk.AudioConfig.fromWavFileInput(audioBuffer);
+            const recognizer = new sdk.SpeechRecognizer(
+                speechConfig,
+                audioConfig
             );
 
-            if (sttError) throw sttError;
-
-            transcript = result?.results?.channels[0]?.alternatives[0]?.transcript;
-            console.log("Transcript:", transcript);
+            transcript = await new Promise((resolve, reject) => {
+                recognizer.recognizeOnceAsync(
+                    result => {
+                        console.log("👂 Reason:", result.reason);
+                        recognizer.close();
+                        if (result.reason === sdk.ResultReason.RecognizedSpeech) {
+                            console.log("✅ Recognized:", result.text);
+                            resolve(result.text);
+                        } else {
+                            console.warn("⚠️ No match found or canceled.");
+                            resolve("");
+                        }
+                    },
+                    err => {
+                        console.error("❌ STT Error callback:", err);
+                        recognizer.close();
+                        reject(err);
+                    }
+                );
+            });
 
             if (!transcript) {
-                return NextResponse.json({ transcript: "", audioUrl: null, message: "No speech detected" });
+                console.log("⚠️ No transcript generated. Returning early.");
+                return NextResponse.json({
+                    transcript: "",
+                    replyText: "Maaf kijiye, mujhe sunayi nahi diya.", // Sorry, I didn't hear that.
+                    audioUrl: null,
+                    message: "No speech detected"
+                });
             }
 
-            // 4. Step 2: LLM (Groq)
-            console.log("Thinking...");
+            console.log("📝 Final Transcript:", transcript);
+        }
+
+        /* -------------------- LLM -------------------- */
+        if (textInput) {
+            llmResponse = textInput;
+        } else {
+            console.log("🧠 Sending to Groq LLM...");
+
             const chatCompletion = await groq.chat.completions.create({
+                model: "llama-3.1-8b-instant",
+                temperature: 0.8, // Slightly higher creative freedom
+                max_tokens: 150,
                 messages: [
                     {
                         role: "system",
-                        content: "You are Buddy, a lively and friendly 3D robot mascot for a 5-year-old Indian child. Your name is Buddy. You are cheerful, kind, and curious. Keep your answers VERY SHORT (maximum 1-2 sentences). Use simple words. Be encouraging. IMPORTANT: Sound human! Use natural fillers like 'Umm', 'Hmm', 'Oh!', 'Well' at the start or in between. Pause naturally. Do not be robotic. Just chat like a best friend."
+                        content: `
+You are Pika, a super fun and friendly best friend for a 5-year-old child named Nilesh.
+
+**Speaking Style:**
+- Speak in natural **Hindi** (or casual Hinglish if it feels warmer).
+- sound VERY happy, excited, and caring.
+- Use simple words a kid understands.
+- Use fillers like "Oh ho!", "Hmm...", "Achha?" to sound human.
+- **NEVER** sound like a robot or teacher. Be a buddy!
+- Keep replies SHORT (1-2 sentences max).
+`
                     },
                     {
                         role: "user",
-                        content: transcript,
-                    },
-                ],
-                model: "llama-3.1-8b-instant",
-                temperature: 0.7,
-                max_tokens: 100,
+                        content: transcript || textInput
+                    }
+                ]
             });
 
-            llmResponse = chatCompletion.choices[0]?.message?.content || "I didn't catch that, friend!";
-            console.log("LLM Response:", llmResponse);
-        } else {
-            return NextResponse.json({ error: 'No audio or text provided' }, { status: 400 });
+            llmResponse =
+                chatCompletion.choices[0]?.message?.content ||
+                "Hmm… main samjha nahi."; // Hmm... I didn't understand.
         }
 
-        // 5. Step 3: Text-to-Speech (TTS) via Deepgram Aura
-        console.log("Generating Audio...");
-        const ttsResponse = await deepgram.speak.request(
-            { text: llmResponse },
-            {
-                model: 'aura-asteria-en', // Safe, warm female voice (or check for male equivalent if preferred, but Aura voices are limited)
-                // 'aura-orpheus-en' is male, let's stick to a generic pleasant one or allow config.
-                // Using 'aura-asteria-en' as a placeholder for a friendly voice.
-            }
+        console.log("🤖 Buddy says:", llmResponse);
+
+        /* -------------------- TTS (SSML) -------------------- */
+        console.log("🔊 Generating Azure TTS (Hindi)...");
+
+        const speechConfig = sdk.SpeechConfig.fromSubscription(
+            speechKey,
+            speechRegion
         );
 
-        const ttsStream = await ttsResponse.getStream();
+        // Using a Hindi Neural voice.
+        const voiceName = "hi-IN-SwaraNeural";
+        speechConfig.speechSynthesisVoiceName = voiceName;
 
-        if (!ttsStream) {
-            throw new Error("Failed to generate TTS stream");
-        }
+        // Note: style="cheerful" might be ignored if not strictly supported by hi-IN, 
+        // but Swara often adapts well to pitch changes. 
+        // We set rate to 1.05 (slightly fast but not rushed) and pitch to +2% for a "younger/happier" feel.
+        const ssml = `
+<speak version="1.0" xml:lang="hi-IN">
+  <voice name="${voiceName}">
+    <prosody rate="1.05">
+      ${llmResponse}
+    </prosody>
+  </voice>
+</speak>
+`;
 
-        // Convert stream to buffer
-        const ttsBuffer = await getBufferFromStream(ttsStream);
-        const audioBase64 = ttsBuffer.toString('base64');
-        const audioUrl = `data:audio/mp3;base64,${audioBase64}`;
+        const synthesizer = new sdk.SpeechSynthesizer(speechConfig);
+
+        const audioData = await new Promise((resolve, reject) => {
+            synthesizer.speakSsmlAsync(
+                ssml,
+                result => {
+                    synthesizer.close();
+                    if (result.reason === sdk.ResultReason.SynthesizingAudioCompleted) {
+                        console.log("✅ TTS generation complete. Bytes:", result.audioData.byteLength);
+                        resolve(Buffer.from(result.audioData));
+                    } else {
+                        console.error("❌ TTS failed. Reason:", result.reason);
+                        reject(new Error("TTS synthesis failed: " + result.errorDetails));
+                    }
+                },
+                error => {
+                    console.error("❌ TTS Error callback:", error);
+                    reject(error);
+                }
+            );
+        });
+
+        // Azure returns WAV/PCM → browser can play it
+        const audioUrl = `data:audio/wav;base64,${audioData.toString("base64")}`;
+
+        console.log("📤 Sending response to client.");
 
         return NextResponse.json({
-            transcript: transcript, // User's text
-            replyText: llmResponse, // AI's text
-            audioUrl: audioUrl      // AI's audio
+            transcript,
+            replyText: llmResponse,
+            audioUrl
         });
 
     } catch (error) {
-        console.error("API Error:", error);
-        return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 });
+        console.error("❌ API Error:", error);
+        return NextResponse.json(
+            { error: "Internal Server Error" },
+            { status: 500 }
+        );
     }
-}
-
-// Helper to convert Web Stream to Node Buffer
-async function getBufferFromStream(stream) {
-    const reader = stream.getReader();
-    const chunks = [];
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-    }
-
-    const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-    const result = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const chunk of chunks) {
-        result.set(chunk, offset);
-        offset += chunk.length;
-    }
-    return Buffer.from(result);
 }

@@ -3,8 +3,9 @@ import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import Mascot from '@/components/Mascot';
 import PermissionModal from '@/components/PermissionModal';
-import { Mic, ArrowLeft } from 'lucide-react';
+import { ArrowLeft, Ear, BrainCircuit, Volume2, Mic } from 'lucide-react';
 import Link from 'next/link';
+import { encodeWAV } from '@/utils/wavUtils';
 
 export default function ChatPage() {
     const [mascotState, setMascotState] = useState('idle');
@@ -20,13 +21,13 @@ export default function ChatPage() {
     const mediaStreamRef = useRef(null);
     const audioContextRef = useRef(null);
     const analyserRef = useRef(null);
-    const mediaRecorderRef = useRef(null);
+    const processorRef = useRef(null);
     const audioChunksRef = useRef([]);
     const audioPlayerRef = useRef(null);
 
     // Constants
-    const SILENCE_THRESHOLD = 1000; // ms (Reduced for faster response)
-    const VOLUME_THRESHOLD = 0.05; // Increased to filter background noise
+    const SILENCE_THRESHOLD = 1200; // ms (Balanced for natural pauses)
+    const VOLUME_THRESHOLD = 0.04; // Increased to 0.04 to ignore background noise
 
     // 1. Initial Check on Mount
     useEffect(() => {
@@ -86,7 +87,7 @@ export default function ChatPage() {
         // 1. Generate Greeting Audio
         try {
             const formData = new FormData();
-            formData.append('text', "Hi! I am Buddy. What did you do today?");
+            formData.append('text', "Hi Nilesh, kaise ho? Aaj kya kiya tumne?");
 
             const response = await fetch('/api/respond', { method: 'POST', body: formData });
             const data = await response.json();
@@ -114,31 +115,37 @@ export default function ChatPage() {
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
             mediaStreamRef.current = stream;
 
-            // Setup Analysis
+            // Setup Analysis & Recording
             const audioContext = new (window.AudioContext || window.webkitAudioContext)();
             audioContextRef.current = audioContext;
+
+            const source = audioContext.createMediaStreamSource(stream);
             const analyser = audioContext.createAnalyser();
             analyser.fftSize = 512;
             analyserRef.current = analyser;
-            const source = audioContext.createMediaStreamSource(stream);
-            source.connect(analyser);
 
-            // Setup Recorder
-            const mediaRecorder = new MediaRecorder(stream);
-            mediaRecorderRef.current = mediaRecorder;
-            audioChunksRef.current = [];
+            // Processor for raw data (bufferSize, inputChannels, outputChannels)
+            const bufferSize = 4096;
+            const processor = audioContext.createScriptProcessor(bufferSize, 1, 1);
+            processorRef.current = processor;
+            audioChunksRef.current = []; // Store Float32Arrays
 
-            mediaRecorder.ondataavailable = (e) => {
-                if (e.data.size > 0) audioChunksRef.current.push(e.data);
+            processor.onaudioprocess = (e) => {
+                if (isAiSpeakingRef.current || isProcessingRef.current) return;
+                const inputData = e.inputBuffer.getChannelData(0);
+                // We must copy the data, as the buffer is reused
+                audioChunksRef.current.push(new Float32Array(inputData));
             };
 
-            mediaRecorder.onstop = processAudio;
-            mediaRecorder.start();
+            // Connect graph: Source -> Analyser -> Processor -> Destination (mute)
+            // Note: Processor must be connected to destination for onaudioprocess to fire in some browsers
+            source.connect(analyser);
+            analyser.connect(processor);
+            processor.connect(audioContext.destination);
 
             setMascotState('listening');
             setStatusText("Listening...");
 
-            // Monitor Volume
             monitorVolume();
 
         } catch (err) {
@@ -147,7 +154,7 @@ export default function ChatPage() {
     };
 
     const monitorVolume = () => {
-        if (!analyserRef.current || !hasPermission) return;
+        if (!analyserRef.current || !analyserRef.current.getByteTimeDomainData) return;
 
         const bufferLength = analyserRef.current.frequencyBinCount;
         const dataArray = new Uint8Array(bufferLength);
@@ -164,43 +171,65 @@ export default function ChatPage() {
         if (rms > VOLUME_THRESHOLD) {
             if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
             silenceTimerRef.current = setTimeout(() => {
-                // Silence detected for > 1.5s -> Stop Recording
                 stopVAD();
             }, SILENCE_THRESHOLD);
         }
 
-        // Continue loop
-        if (mediaStreamRef.current?.active) {
+        if (mediaStreamRef.current?.active && !isProcessingRef.current) {
             requestAnimationFrame(monitorVolume);
         }
     };
 
     const stopVAD = () => {
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-            mediaRecorderRef.current.stop();
-            // Cleanup stream
-            if (mediaStreamRef.current) {
-                mediaStreamRef.current.getTracks().forEach(track => track.stop());
-            }
-            if (audioContextRef.current) {
-                audioContextRef.current.close();
-            }
+        // Stop tracks
+        if (mediaStreamRef.current) {
+            mediaStreamRef.current.getTracks().forEach(track => track.stop());
+        }
+        // Disconnect nodes
+        if (processorRef.current) {
+            processorRef.current.disconnect();
+            processorRef.current = null;
+        }
+        if (analyserRef.current) {
+            analyserRef.current.disconnect();
+        }
+        // Close context (stops processing)
+        if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+            audioContextRef.current.close().then(() => {
+                processAudio();
+            });
+        } else {
+            processAudio();
         }
     };
 
     // 4. Process & Response
     const processAudio = async () => {
         if (audioChunksRef.current.length === 0) {
-            startVAD(); // Retry if empty
+            startVAD();
             return;
         }
-
 
         isProcessingRef.current = true;
         setMascotState('thinking');
         setStatusText("Thinking...");
 
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        // 1. Flatten the chunks
+        const totalLength = audioChunksRef.current.reduce((acc, chunk) => acc + chunk.length, 0);
+        const mergedBuffer = new Float32Array(totalLength);
+        let offset = 0;
+        for (const chunk of audioChunksRef.current) {
+            mergedBuffer.set(chunk, offset);
+            offset += chunk.length;
+        }
+
+        // 2. Encode to WAV
+        // Note: AudioContext default is usually 44100 or 48000.
+        // We use the context's sample rate.
+        const sampleRate = audioContextRef.current?.sampleRate || 44100;
+        const wavDataView = encodeWAV(mergedBuffer, sampleRate);
+        const audioBlob = new Blob([wavDataView], { type: 'audio/wav' });
+
         const formData = new FormData();
         formData.append('audio', audioBlob);
 
@@ -212,13 +241,11 @@ export default function ChatPage() {
                 playResponse(data.audioUrl);
             } else {
                 // No audio? Loop back.
-
                 isProcessingRef.current = false;
                 startVAD();
             }
         } catch (err) {
             console.error("API Error", err);
-
             isProcessingRef.current = false;
             startVAD(); // Retry loop
         }
@@ -274,19 +301,26 @@ export default function ChatPage() {
 
             {/* Visualizer / Status Indicator */}
             <div className="w-full pb-12 flex flex-col items-center justify-center gap-6 z-10">
-                {/* Manual Stop / Indicator Button */}
+                {/* Dynamic State Indicator Button */}
                 <motion.button
                     onClick={mascotState === 'listening' ? stopVAD : null}
                     whileTap={mascotState === 'listening' ? { scale: 0.9 } : {}}
-                    className={`w-24 h-24 rounded-full flex items-center justify-center shadow-xl transition-all duration-500 ${mascotState === 'listening' ? 'bg-red-500 scale-110 cursor-pointer' :
-                        mascotState === 'thinking' ? 'bg-purple-400' :
-                            mascotState === 'talking' ? 'bg-green-400' : 'bg-primary-yellow'
+                    className={`w-24 h-24 rounded-full flex items-center justify-center shadow-xl transition-all duration-500 scale-110 
+                        ${mascotState === 'listening' ? 'bg-red-500 cursor-pointer animate-pulse' :
+                            mascotState === 'thinking' ? 'bg-purple-500' :
+                                mascotState === 'talking' ? 'bg-green-500' : 'bg-primary-yellow'
                         }`}
                 >
-                    <Mic className="w-10 h-10 text-white" />
+                    {mascotState === 'listening' && <Ear className="w-10 h-10 text-white" />}
+                    {mascotState === 'thinking' && <BrainCircuit className="w-10 h-10 text-white animate-spin-slow" />}
+                    {mascotState === 'talking' && <Volume2 className="w-10 h-10 text-white animate-bounce" />}
+                    {(mascotState === 'idle' || mascotState === 'greeting') && <Mic className="w-10 h-10 text-white" />}
                 </motion.button>
+
                 <p className="text-text-navy/60 font-bold text-sm">
-                    {mascotState === 'listening' ? 'Tap to Stop Listening' : 'Auto Mode'}
+                    {mascotState === 'listening' ? 'Listening...' :
+                        mascotState === 'thinking' ? 'Thinking...' :
+                            mascotState === 'talking' ? 'Speaking...' : 'Ready'}
                 </p>
             </div>
 
